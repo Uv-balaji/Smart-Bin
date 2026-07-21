@@ -1,0 +1,18 @@
+#include <SPI.h>
+#include <DMD2.h>
+#include <fonts/SystemFont5x7.h>
+
+SPIDMD dmd(1, 1, 9, 8, 7, 4);
+
+void setup() {
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+
+  dmd.setBrightness(255);
+  dmd.selectFont(SystemFont5x7);
+  dmd.begin();
+
+  dmd.drawString(1, 4, "PRABA");
+}
+
+void loop() {}
