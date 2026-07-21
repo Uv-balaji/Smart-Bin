@@ -1,0 +1,38 @@
+
+#include <SPI.h>
+#include <DMD2.h>
+#include <fonts/SystemFont5x7.h>
+
+SPIDMD dmd(1, 1, 9, 8, 7, 4);
+
+String scrollText = "Kiss me on the mouth and love me like a sailor"; 
+int textPositionX = 32; 
+
+void setup() {
+  pinMode(53, OUTPUT);
+  digitalWrite(53, HIGH);
+
+  dmd.setBrightness(255);
+  dmd.selectFont(SystemFont5x7);
+  dmd.begin();
+}
+
+void loop() {
+  dmd.clearScreen(); 
+  
+  int len = scrollText.length();
+  for (int i = 0; i < len; i++) {
+    int charX = textPositionX + (i * 6);
+    if (charX > -6 && charX < 32) {
+      dmd.drawString(charX, 0, String(scrollText[i])); 
+    }
+  }
+  
+  textPositionX--; 
+  
+  if (textPositionX < -(len * 6)) { 
+    textPositionX = 32; 
+  }
+  
+  delay(30); 
+}
