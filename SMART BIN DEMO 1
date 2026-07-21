@@ -1,0 +1,155 @@
+// ============================================================
+//  GM67 Scanner + P10 Red Monochrome Display
+//  Arduino UNO | DMD2 Library | SoftwareSerial for GM67
+// ============================================================
+
+#include <SPI.h>
+#include <DMD2.h>
+#include <fonts/SystemFont5x7.h>
+#include <SoftwareSerial.h>
+
+SoftwareSerial scannerSerial(2, 3);
+SPIDMD dmd(1, 1, 9, 8, 7, 4);
+
+// --- Scroll state ---
+String  displayText  = "WELCOME SCAN ID";
+int     textPosX     = 32;
+int     textPixelLen = 0;
+
+unsigned long lastScrollTime = 0;
+const int     SCROLL_DELAY   = 30;
+
+// --- Thankyou state ---
+bool          showingID       = false;
+unsigned long idDisplayedAt   = 0;
+const unsigned long THANKYOU_DELAY = 4000;  // 4 seconds — tune 3000-5000
+
+// --- GM67 state ---
+const int     MAX_ID_LENGTH  = 32;
+char          idBuffer[MAX_ID_LENGTH];
+int           idIndex        = 0;
+
+String        lastScannedID  = "";
+unsigned long lastScanTime   = 0;
+const unsigned long DUPLICATE_IGNORE_WINDOW = 3000;
+
+// ============================================================
+void setup() {
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+
+  Serial.begin(9600);
+  scannerSerial.begin(9600);
+
+  dmd.setBrightness(255);
+  dmd.selectFont(SystemFont5x7);
+  dmd.begin();
+
+  setDisplayText("WELCOME SCAN ID");
+  Serial.println("Ready.");
+}
+
+// ============================================================
+void loop() {
+  readScanner();
+  checkThankYou();     // monitors when to switch to thank you
+  updateScroll();
+}
+
+// ============================================================
+void setDisplayText(String text) {
+  displayText  = text;
+  textPixelLen = text.length() * 6;
+  textPosX     = 32;
+}
+
+// ============================================================
+// After THANKYOU_DELAY ms of showing ID → switch to thank you
+// ============================================================
+void checkThankYou() {
+  if (!showingID) return;
+
+  unsigned long now = millis();
+  if (now - idDisplayedAt >= THANKYOU_DELAY) {
+    showingID = false;
+    setDisplayText("THANK YOU COME LATER");
+    Serial.println("Showing: THANK YOU COME LATER");
+  }
+}
+
+// ============================================================
+void updateScroll() {
+  unsigned long now = millis();
+  if (now - lastScrollTime < SCROLL_DELAY) return;
+  lastScrollTime = now;
+
+  dmd.clearScreen();
+
+  int len = displayText.length();
+  for (int i = 0; i < len; i++) {
+    int charX = textPosX + (i * 6);
+    if (charX > -6 && charX < 32) {
+      dmd.drawString(charX, 4, String(displayText[i]));
+    }
+  }
+
+  textPosX--;
+  if (textPosX < -(textPixelLen)) {
+    // If thank you finished scrolling → go back to SCAN ID
+    if (!showingID) {
+      setDisplayText("WELCOME SCAN ID");
+    } else {
+      textPosX = 32;
+    }
+  }
+}
+
+// ============================================================
+void readScanner() {
+  while (scannerSerial.available()) {
+    char c = scannerSerial.read();
+
+    if (c == '\r' || c == '\n') {
+      if (idIndex > 0) {
+        idBuffer[idIndex] = '\0';
+        processScannedID(idBuffer);
+        idIndex = 0;
+      }
+    } else {
+      if (idIndex < MAX_ID_LENGTH - 1) {
+        idBuffer[idIndex++] = c;
+      }
+    }
+  }
+}
+
+// ============================================================
+void processScannedID(const char* rawID) {
+  String scannedID = String(rawID);
+  scannedID.trim();
+  if (scannedID.length() == 0) return;
+
+  unsigned long now = millis();
+  if (scannedID == lastScannedID &&
+     (now - lastScanTime) < DUPLICATE_IGNORE_WINDOW) {
+    Serial.println("Duplicate ignored: " + scannedID);
+    return;
+  }
+
+  lastScannedID = scannedID;
+  lastScanTime  = now;
+
+  Serial.println("Scanned: " + scannedID);
+
+  // Show ID and start the thank you countdown
+  setDisplayText(scannedID);
+  showingID      = true;
+  idDisplayedAt  = millis();
+
+  handleCredit(scannedID);
+}
+
+// ============================================================
+void handleCredit(String id) {
+  Serial.println("Crediting: " + id);
+}
