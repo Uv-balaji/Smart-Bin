@@ -1,0 +1,26 @@
+#include <SoftwareSerial.h>
+
+// RX, TX pins - connect GM67 TX to Arduino RX pin
+SoftwareSerial gm67(2, 3); // RX = pin 2, TX = pin 3
+
+void setup() {
+  Serial.begin(9600);      // Serial monitor
+  gm67.begin(9600);         // GM67 default baud rate (check your module's manual)
+  Serial.println("GM67 Barcode Scanner Ready...");
+}
+
+void loop() {
+  if (gm67.available()) {
+    String barcode = "";
+    while (gm67.available()) {
+      char c = gm67.read();
+      barcode += c;
+      delay(2); // small delay to let buffer fill
+    }
+    barcode.trim(); // remove trailing \r\n
+    if (barcode.length() > 0) {
+      Serial.print("Scanned: ");
+      Serial.println(barcode);
+    }
+  }
+}
