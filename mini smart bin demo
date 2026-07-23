@@ -1,0 +1,362 @@
+// ============================================================
+//  Smart Bin — GM67 Scanner + P10 Display + Two Servos (UNO-safe)
+//  Arduino UNO | DMD2 Library | SoftwareSerial for GM67
+//
+//  Servos are driven WITHOUT the Servo library, using hand-timed
+//  pulses so DMD2's Timer1 refresh is never touched. The actual
+//  pulse (HIGH -> delay -> LOW) is wrapped in noInterrupts()/
+//  interrupts() so the DMD refresh ISR can't stretch the pulse
+//  mid-way and cause servo jitter. This briefly pauses display
+//  refresh (~1-2ms every 20ms) but keeps servo timing accurate.
+//
+//  Flow:
+//   1. Idle: display scrolls "SMART BIN SCAN ID"
+//   2. GM67 scans an ID -> display shows the ID, waits for input
+//   3. Input arrives via Serial Monitor: "BIO" or "NON BIO"
+//   4. Display immediately shows "THANK YOU COME LATER" while the
+//      correct servo actuates in the background
+//   5. After actuation + settle time, returns to idle
+// ============================================================
+
+#include <SPI.h>
+#include <DMD2.h>
+#include <fonts/SystemFont5x7.h>
+#include <SoftwareSerial.h>
+
+// ---------------- Hardware ----------------
+SoftwareSerial scannerSerial(2, 3);
+SPIDMD dmd(1, 1, 9, 8, 7, 4);
+
+#define SERVO_BIO_PIN     5
+#define SERVO_NONBIO_PIN  6
+
+// ---------------- Manual servo pulse generation ----------------
+#define SERVO_PERIOD_US      20000UL  // standard servo refresh rate: 50Hz
+#define SERVO_SETTLE_MS      400UL    // how long we keep re-sending the final pulse
+
+unsigned long servoLastPulseTime = 0;
+int           activeServoPin     = -1;
+int           activeServoPulseUs = 1500;
+bool          servoActive        = false;
+
+int angleToPulseUs(int angleDeg) {
+  return map(angleDeg, 0, 180, 1000, 2000);
+}
+
+// Sends one precisely-timed pulse. Interrupts are disabled only for
+// the pulse itself so DMD2's refresh ISR can't stretch it.
+void sendServoPulse(int pin, int pulseUs) {
+  noInterrupts();
+  digitalWrite(pin, HIGH);
+  delayMicroseconds(pulseUs);
+  digitalWrite(pin, LOW);
+  interrupts();
+}
+
+// Call every loop() iteration. Sends a pulse only when the 20ms
+// window has elapsed.
+void driveServoPulses() {
+  if (!servoActive || activeServoPin == -1) return;
+
+  unsigned long now = micros();
+  if (now - servoLastPulseTime >= SERVO_PERIOD_US) {
+    servoLastPulseTime = now;
+    sendServoPulse(activeServoPin, activeServoPulseUs);
+  }
+}
+
+// Blocking helper, used only once at boot to move both servos to
+// a known safe position before the main loop starts.
+void initServoPosition(int pin, int pulseUs, unsigned long durationMs) {
+  unsigned long start = millis();
+  while (millis() - start < durationMs) {
+    sendServoPulse(pin, pulseUs);
+    delay(18); // completes roughly a 20ms period
+  }
+}
+
+// ---------------- Servo angles / pulses / timings ----------------
+#define BIO_CLOSED_ANGLE     0
+#define BIO_OPEN_ANGLE       90
+#define BIO_OPEN_HOLD_MS     3000UL   // how long bio lid stays open
+
+#define NONBIO_STOP_PULSE_US 1500     // 360° servo: neutral/stopped
+#define NONBIO_RUN_PULSE_US  1000     // away from 1500 = rotating (flip to 2000 for opposite direction)
+#define NONBIO_RUN_MS        1500UL   // how long the 360° servo runs to open
+
+#define THANKYOU_DELAY_MS    4000UL
+
+// ---------------- Scroll state ----------------
+String  displayText  = "SMART BIN SCAN ID";
+int     textPosX     = 32;
+int     textPixelLen = 0;
+
+unsigned long lastScrollTime = 0;
+const int     SCROLL_DELAY   = 30;
+
+// ---------------- GM67 scanner state ----------------
+const int MAX_ID_LENGTH = 32;
+char      idBuffer[MAX_ID_LENGTH];
+int       idIndex = 0;
+
+String        lastScannedID = "";
+unsigned long lastScanTime  = 0;
+const unsigned long DUPLICATE_IGNORE_WINDOW = 3000UL;
+
+// ---------------- System state machine ----------------
+enum SystemState {
+  STATE_IDLE_SCAN,            // scrolling "SCAN ID", waiting for a scan
+  STATE_ID_SHOWN_WAIT_INPUT,  // ID shown, waiting for bio/non-bio input
+  STATE_BIO_ACTUATING,        // bio servo holding open (display: THANK YOU)
+  STATE_BIO_SETTLING,         // bio servo closing, sending final pulse repeatedly
+  STATE_NONBIO_ACTUATING,     // non-bio servo running (display: THANK YOU)
+  STATE_NONBIO_SETTLING,      // non-bio servo stopping, sending final pulse repeatedly
+  STATE_THANKYOU              // showing thank-you message, then back to idle
+};
+
+SystemState   currentState    = STATE_IDLE_SCAN;
+unsigned long stateEnteredAt  = 0;
+String        currentID       = "";
+
+// ============================================================
+void setup() {
+  // UNO hardware SPI requires the SS pin (10 on UNO, 53 on Mega) to be
+  // held HIGH as an OUTPUT, or the SPI hardware can drop into slave mode
+  // and the display won't respond at all.
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+
+  pinMode(SERVO_BIO_PIN, OUTPUT);
+  pinMode(SERVO_NONBIO_PIN, OUTPUT);
+
+  Serial.begin(9600);
+  scannerSerial.begin(9600);
+
+  dmd.setBrightness(100);
+  dmd.selectFont(SystemFont5x7);
+  dmd.begin();
+
+  Serial.println(F("[SERVO] Setting initial positions..."));
+  initServoPosition(SERVO_BIO_PIN, angleToPulseUs(BIO_CLOSED_ANGLE), 500);
+  initServoPosition(SERVO_NONBIO_PIN, NONBIO_STOP_PULSE_US, 500);
+  Serial.println(F("[SERVO] Initial positions set."));
+
+  goToIdle();
+
+  Serial.println(F("[BOOT] Smart bin ready."));
+  Serial.println(F("[BOOT] Type BIO or NON BIO in Serial Monitor after a scan to test."));
+}
+
+// ============================================================
+void loop() {
+  updateScroll();
+  driveServoPulses();
+
+  switch (currentState) {
+    case STATE_IDLE_SCAN:
+      readScanner();
+      break;
+
+    case STATE_ID_SHOWN_WAIT_INPUT:
+      checkSerialInput();
+      break;
+
+    case STATE_BIO_ACTUATING:
+      updateBioActuation();
+      break;
+
+    case STATE_BIO_SETTLING:
+      updateBioSettling();
+      break;
+
+    case STATE_NONBIO_ACTUATING:
+      updateNonBioActuation();
+      break;
+
+    case STATE_NONBIO_SETTLING:
+      updateNonBioSettling();
+      break;
+
+    case STATE_THANKYOU:
+      updateThankYou();
+      break;
+  }
+}
+
+// ============================================================
+//  Display helpers
+// ============================================================
+void setDisplayText(String text) {
+  displayText  = text;
+  textPixelLen = text.length() * 6;
+  textPosX     = 32;
+}
+
+void updateScroll() {
+  unsigned long now = millis();
+  if (now - lastScrollTime < SCROLL_DELAY) return;
+  lastScrollTime = now;
+
+  dmd.clearScreen();
+
+  int len = displayText.length();
+  for (int i = 0; i < len; i++) {
+    int charX = textPosX + (i * 6);
+    if (charX > -6 && charX < 32) {
+      dmd.drawString(charX, 4, String(displayText[i]));
+    }
+  }
+
+  textPosX--;
+  if (textPosX < -(textPixelLen)) {
+    textPosX = 32; // loop the current message until state logic changes it
+  }
+}
+
+// ============================================================
+//  State transitions
+// ============================================================
+void goToIdle() {
+  currentState = STATE_IDLE_SCAN;
+  currentID    = "";
+  setDisplayText("SMART BIN SCAN ID");
+  Serial.println(F("[STATE] IDLE_SCAN — waiting for a scan"));
+}
+
+void goToWaitInput(String id) {
+  currentState   = STATE_ID_SHOWN_WAIT_INPUT;
+  currentID      = id;
+  stateEnteredAt = millis();
+  setDisplayText(id);
+  Serial.println("[STATE] ID_SHOWN_WAIT_INPUT — waiting for BIO/NON BIO input for ID: " + id);
+}
+
+void updateThankYou() {
+  if (millis() - stateEnteredAt >= THANKYOU_DELAY_MS) {
+    goToIdle();
+  }
+}
+
+// ============================================================
+//  GM67 scanner reading
+// ============================================================
+void readScanner() {
+  while (scannerSerial.available()) {
+    char c = scannerSerial.read();
+
+    if (c == '\r' || c == '\n') {
+      if (idIndex > 0) {
+        idBuffer[idIndex] = '\0';
+        processScannedID(idBuffer);
+        idIndex = 0;
+      }
+    } else if (idIndex < MAX_ID_LENGTH - 1) {
+      idBuffer[idIndex++] = c;
+    }
+  }
+}
+
+void processScannedID(const char* rawID) {
+  String scannedID = String(rawID);
+  scannedID.trim();
+  if (scannedID.length() == 0) return;
+
+  unsigned long now = millis();
+  if (scannedID == lastScannedID && (now - lastScanTime) < DUPLICATE_IGNORE_WINDOW) {
+    Serial.println("[SCAN] Duplicate ignored: " + scannedID);
+    return;
+  }
+
+  lastScannedID = scannedID;
+  lastScanTime  = now;
+
+  Serial.println("[SCAN] Scanned ID: " + scannedID);
+  goToWaitInput(scannedID);
+}
+
+// ============================================================
+//  Bio / non-bio input (Serial Monitor for now)
+// ============================================================
+void checkSerialInput() {
+  if (!Serial.available()) return;
+
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+  input.toUpperCase();
+
+  if (input.length() == 0) return;
+
+  Serial.println("[INPUT] Received: " + input);
+
+  if (input == "BIO") {
+    startBioOpen();
+  } else if (input == "NON BIO" || input == "NONBIO") {
+    startNonBioOpen();
+  } else {
+    Serial.println(F("[INPUT] Not recognized. Type BIO or NON BIO."));
+  }
+}
+
+// ============================================================
+//  Bio bin — 180° servo (manual pulse control)
+// ============================================================
+void startBioOpen() {
+  Serial.println("[SERVO-BIO] Opening for ID: " + currentID);
+  activeServoPin     = SERVO_BIO_PIN;
+  activeServoPulseUs = angleToPulseUs(BIO_OPEN_ANGLE);
+  servoActive        = true;
+  stateEnteredAt      = millis();
+  currentState        = STATE_BIO_ACTUATING;
+  setDisplayText("THANK YOU COME LATER"); // shown immediately, no "BIO BIN OPEN" step
+}
+
+void updateBioActuation() {
+  if (millis() - stateEnteredAt >= BIO_OPEN_HOLD_MS) {
+    Serial.println(F("[SERVO-BIO] Closing"));
+    activeServoPulseUs = angleToPulseUs(BIO_CLOSED_ANGLE);
+    stateEnteredAt      = millis();
+    currentState        = STATE_BIO_SETTLING;
+  }
+}
+
+void updateBioSettling() {
+  if (millis() - stateEnteredAt >= SERVO_SETTLE_MS) {
+    servoActive    = false;
+    activeServoPin = -1;
+    Serial.println(F("[SERVO-BIO] Closed"));
+    currentState   = STATE_THANKYOU;
+    stateEnteredAt = millis();
+  }
+}
+
+// ============================================================
+//  Non-bio bin — 360° continuous rotation servo (manual pulse control)
+// ============================================================
+void startNonBioOpen() {
+  Serial.println("[SERVO-NONBIO] Rotating open for ID: " + currentID);
+  activeServoPin     = SERVO_NONBIO_PIN;
+  activeServoPulseUs = NONBIO_RUN_PULSE_US;
+  servoActive        = true;
+  stateEnteredAt      = millis();
+  currentState        = STATE_NONBIO_ACTUATING;
+  setDisplayText("THANK YOU COME LATER"); // shown immediately, no "NON BIO BIN OPEN" step
+}
+
+void updateNonBioActuation() {
+  if (millis() - stateEnteredAt >= NONBIO_RUN_MS) {
+    Serial.println(F("[SERVO-NONBIO] Stopping"));
+    activeServoPulseUs = NONBIO_STOP_PULSE_US;
+    stateEnteredAt      = millis();
+    currentState        = STATE_NONBIO_SETTLING;
+  }
+}
+
+void updateNonBioSettling() {
+  if (millis() - stateEnteredAt >= SERVO_SETTLE_MS) {
+    servoActive    = false;
+    activeServoPin = -1;
+    Serial.println(F("[SERVO-NONBIO] Stopped"));
+    currentState   = STATE_THANKYOU;
+    stateEnteredAt = millis();
+  }
+}
