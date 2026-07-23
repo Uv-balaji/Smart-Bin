@@ -1,0 +1,34 @@
+#include <Servo.h>
+
+Servo myServo;  // Create a servo object to control the RKI-1206
+
+const int servoPin = 9;  // Define the digital pin connected to the servo signal wire
+
+void setup() {
+  Serial.begin(9600);          // Initialize serial communication at 9600 baud
+  myServo.attach(servoPin);    // Attaches the servo on pin 9 to the servo object
+  
+  Serial.println("Servo Control Initialized.");
+  Serial.println("Please enter an angle between 0 and 180 degrees:");
+}
+
+void loop() {
+  // Check if data is available to read from the Serial Monitor
+  if (Serial.available() > 0) {
+    int targetAngle = Serial.parseInt(); 
+
+    // Clear any leftover junk/newlines from the serial buffer
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
+
+    // Validate that the angle is within the 0-180 limits
+    // (We also check that it isn't a accidental timeout zero if you didn't mean 0)
+    if (targetAngle >= 0 && targetAngle <= 180) {
+      myServo.write(targetAngle);  // Command the servo to move
+      Serial.print("Moving to and staying at: ");
+      Serial.print(targetAngle);
+      Serial.println(" degrees");
+    } 
+  }
+}
