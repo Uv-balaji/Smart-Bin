@@ -1,0 +1,35 @@
+void setup() {
+  // USB Serial - to see data in Serial Monitor
+  Serial.begin(9600);
+
+  // Hardware UART - connected to GM67
+  Serial1.begin(9600); // GM67 default baud rate
+
+  Serial.println("=========================");
+  Serial.println("  GM67 Barcode Scanner   ");
+  Serial.println("  Arduino Uno Q Ready!   ");
+  Serial.println("=========================");
+  Serial.println("Waiting for scan...");
+}
+void loop() {
+  // Check if GM67 sent any data
+  if (Serial1.available()) {
+    String barcode = "";
+
+    // Read all incoming barcode data
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      barcode += c;
+      delay(5);
+    }
+
+    // Clean up the data
+    barcode.trim();
+
+    // Print to Serial Monitor
+    Serial.println("─────────────────────");
+    Serial.print("Barcode: ");
+    Serial.println(barcode);
+    Serial.println("─────────────────────");
+  }
+}
