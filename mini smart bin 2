@@ -1,0 +1,538 @@
+// ============================================================
+//  Smart Bin — GM67 Scanner + P10 Display (raw driver, NO DMD2) + Two Servos
+//  Arduino UNO
+//
+//  Display is now driven directly with the same shift-register /
+//  row-select routine as your working standalone P10 scroller —
+//  no DMD2 library, no SPI library, no Timer1 hijacking.
+//
+//  Because there's no more interrupt-driven refresh, scanDisplay()
+//  is called on every loop() pass so the panel keeps refreshing
+//  while everything else (servo pulses, scanner reads, serial
+//  input, state machine) runs cooperatively via millis()/micros().
+// ============================================================
+
+#include <SoftwareSerial.h>
+
+// ---------------- GM67 scanner ----------------
+SoftwareSerial scannerSerial(2, 3);
+
+// ================================================================
+//  P10 32x16 1/4-scan panel driver (ported from your scroller code)
+// ================================================================
+#define DATA_PIN   11   // R_DATA
+#define CLK_PIN    13   // CLK
+#define OE_PIN      9   // nOE
+#define A_PIN       8   // A
+#define B_PIN       7   // B
+#define LATCH_PIN   4   // SCLK / STB (latch)
+
+#define OE_ACTIVE_LOW 1
+
+#define PANEL_WIDTH_PIXELS  32
+#define PANEL_HEIGHT_PIXELS 16
+#define ROW_BYTES  (PANEL_WIDTH_PIXELS / 8)
+#define RAM_BYTES  (ROW_BYTES * PANEL_HEIGHT_PIXELS)
+
+#define ROW1_OFFSET (ROW_BYTES * 4)
+#define ROW2_OFFSET (ROW_BYTES * 8)
+#define ROW3_OFFSET (ROW_BYTES * 12)
+
+// ---- BOLD CONTROL (0 = normal 1px strokes, 1 = 2px strokes) ----
+#define BOLD_X 0
+#define BOLD_Y 0
+
+// ---- BRIGHTNESS (lower ROW_ON_MICROS if current draw is too high) ----
+#define ROW_SLOT_MICROS 1200
+#define ROW_ON_MICROS   1000
+#define ROW_BLANK_MICROS (ROW_SLOT_MICROS - ROW_ON_MICROS)
+#define ROW_SWITCH_DELAY_MICROS 60
+#define POST_LATCH_BLANK_MICROS 30
+
+byte screenRAM[RAM_BYTES];   // 0 = pixel ON, 1 = pixel OFF
+byte scanRow = 0;
+
+const byte pixelLookup[8] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
+
+inline void clockPulse() {
+  digitalWrite(CLK_PIN, HIGH);
+  digitalWrite(CLK_PIN, LOW);
+}
+
+inline void shiftOutByte(byte b) {
+  for (int8_t i = 7; i >= 0; i--) {
+    digitalWrite(DATA_PIN, (b & (1 << i)) ? HIGH : LOW);
+    clockPulse();
+  }
+}
+
+inline void latchPulse() {
+  digitalWrite(LATCH_PIN, HIGH);
+  digitalWrite(LATCH_PIN, LOW);
+}
+
+#if OE_ACTIVE_LOW
+  inline void rowsOff() { digitalWrite(OE_PIN, LOW);  }
+  inline void rowsOn()  { digitalWrite(OE_PIN, HIGH); }
+#else
+  inline void rowsOff() { digitalWrite(OE_PIN, HIGH); }
+  inline void rowsOn()  { digitalWrite(OE_PIN, LOW);  }
+#endif
+
+inline void selectRowGroup(byte group) {
+  digitalWrite(B_PIN, (group & 0x02) ? HIGH : LOW);
+  digitalWrite(A_PIN, (group & 0x01) ? HIGH : LOW);
+}
+
+void clearScreen(bool allOff) {
+  memset(screenRAM, allOff ? 0xFF : 0x00, RAM_BYTES);
+}
+
+void writePixel(int x, int y, bool on) {
+  if (x < 0 || x >= PANEL_WIDTH_PIXELS || y < 0 || y >= PANEL_HEIGHT_PIXELS) return;
+  int idx = (x / 8) + y * ROW_BYTES;
+  byte mask = pixelLookup[x & 0x07];
+  if (on) screenRAM[idx] &= ~mask;
+  else    screenRAM[idx] |= mask;
+}
+
+// Call as often as possible from loop() — pushes one of the 4 row
+// groups to the panel per call. This replaces DMD2's Timer1 ISR.
+void scanDisplay() {
+  int offset = ROW_BYTES * scanRow;
+
+  rowsOff();
+
+  for (int i = 0; i < ROW_BYTES; i++) {
+    shiftOutByte(screenRAM[offset + i + ROW3_OFFSET]);
+    shiftOutByte(screenRAM[offset + i + ROW2_OFFSET]);
+    shiftOutByte(screenRAM[offset + i + ROW1_OFFSET]);
+    shiftOutByte(screenRAM[offset + i]);
+  }
+
+  latchPulse();
+  delayMicroseconds(POST_LATCH_BLANK_MICROS);
+  selectRowGroup(scanRow);
+  delayMicroseconds(ROW_SWITCH_DELAY_MICROS);
+
+  rowsOn();
+  delayMicroseconds(ROW_ON_MICROS);
+  rowsOff();
+  delayMicroseconds(ROW_BLANK_MICROS);
+
+  scanRow = (scanRow + 1) & 0x03;
+}
+
+// ---- Minimal 5x7 font (same table as your scroller) ----
+const byte font5x7[95][5] = {
+  {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5F,0x00,0x00}, {0x00,0x07,0x00,0x07,0x00},
+  {0x14,0x7F,0x14,0x7F,0x14}, {0x24,0x2A,0x7F,0x2A,0x12}, {0x23,0x13,0x08,0x64,0x62},
+  {0x36,0x49,0x56,0x20,0x50}, {0x00,0x08,0x07,0x03,0x00}, {0x00,0x1C,0x22,0x41,0x00},
+  {0x00,0x41,0x22,0x1C,0x00}, {0x2A,0x1C,0x7F,0x1C,0x2A}, {0x08,0x08,0x3E,0x08,0x08},
+  {0x00,0x80,0x70,0x30,0x00}, {0x08,0x08,0x08,0x08,0x08}, {0x00,0x00,0x60,0x60,0x00},
+  {0x20,0x10,0x08,0x04,0x02}, {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00},
+  {0x72,0x49,0x49,0x49,0x46}, {0x21,0x41,0x49,0x4D,0x33}, {0x18,0x14,0x12,0x7F,0x10},
+  {0x27,0x45,0x45,0x45,0x39}, {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03},
+  {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1E}, {0x00,0x36,0x36,0x00,0x00},
+  {0x00,0x56,0x36,0x00,0x00}, {0x08,0x14,0x22,0x41,0x00}, {0x14,0x14,0x14,0x14,0x14},
+  {0x00,0x41,0x22,0x14,0x08}, {0x02,0x01,0x59,0x09,0x06}, {0x3E,0x41,0x5D,0x59,0x4E},
+  {0x7C,0x12,0x11,0x12,0x7C}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22},
+  {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, {0x7F,0x09,0x09,0x09,0x01},
+  {0x3E,0x41,0x49,0x49,0x7A}, {0x7F,0x08,0x08,0x08,0x7F}, {0x00,0x41,0x7F,0x41,0x00},
+  {0x20,0x40,0x41,0x3F,0x01}, {0x7F,0x08,0x14,0x22,0x41}, {0x7F,0x40,0x40,0x40,0x40},
+  {0x7F,0x02,0x0C,0x02,0x7F}, {0x7F,0x04,0x08,0x10,0x7F}, {0x3E,0x41,0x41,0x41,0x3E},
+  {0x7F,0x09,0x09,0x09,0x06}, {0x3E,0x41,0x51,0x21,0x5E}, {0x7F,0x09,0x19,0x29,0x46},
+  {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7F,0x01,0x01}, {0x3F,0x40,0x40,0x40,0x3F},
+  {0x1F,0x20,0x40,0x20,0x1F}, {0x7F,0x20,0x18,0x20,0x7F}, {0x63,0x14,0x08,0x14,0x63},
+  {0x03,0x04,0x78,0x04,0x03}, {0x61,0x51,0x49,0x45,0x43}, {0x00,0x00,0x7F,0x41,0x41},
+  {0x02,0x04,0x08,0x10,0x20}, {0x41,0x41,0x7F,0x00,0x00}, {0x04,0x02,0x01,0x02,0x04},
+  {0x40,0x40,0x40,0x40,0x40}, {0x00,0x01,0x02,0x04,0x00}, {0x20,0x54,0x54,0x54,0x78},
+  {0x7F,0x48,0x44,0x44,0x38}, {0x38,0x44,0x44,0x44,0x20}, {0x38,0x44,0x44,0x48,0x7F},
+  {0x38,0x54,0x54,0x54,0x18}, {0x08,0x7E,0x09,0x01,0x02}, {0x0C,0x52,0x52,0x52,0x3E},
+  {0x7F,0x08,0x04,0x04,0x78}, {0x00,0x44,0x7D,0x40,0x00}, {0x20,0x40,0x44,0x3D,0x00},
+  {0x7F,0x10,0x28,0x44,0x00}, {0x00,0x41,0x7F,0x40,0x00}, {0x7C,0x04,0x18,0x04,0x78},
+  {0x7C,0x08,0x04,0x04,0x78}, {0x38,0x44,0x44,0x44,0x38}, {0x7C,0x14,0x14,0x14,0x08},
+  {0x08,0x14,0x14,0x18,0x7C}, {0x7C,0x08,0x04,0x04,0x08}, {0x48,0x54,0x54,0x54,0x20},
+  {0x04,0x3F,0x44,0x40,0x20}, {0x3C,0x40,0x40,0x20,0x7C}, {0x1C,0x20,0x40,0x20,0x1C},
+  {0x3C,0x40,0x30,0x40,0x3C}, {0x44,0x28,0x10,0x28,0x44}, {0x0C,0x50,0x50,0x50,0x3C},
+  {0x44,0x64,0x54,0x4C,0x44}, {0x00,0x08,0x36,0x41,0x00}, {0x00,0x00,0x7F,0x00,0x00},
+  {0x00,0x41,0x36,0x08,0x00}, {0x08,0x08,0x2A,0x1C,0x08}
+};
+
+#define GLYPH_W (5 + BOLD_X)
+#define GLYPH_H (7 + BOLD_Y)
+#define CHAR_ADVANCE (GLYPH_W + 1)
+
+void drawCharBold(int x, int y, char c) {
+  if (c < 32 || c > 126) c = 32;
+  const byte *glyph = font5x7[c - 32];
+  for (int col = 0; col < 5; col++) {
+    byte colBits = glyph[col];
+    for (int row = 0; row < 7; row++) {
+      if (!(colBits & (1 << row))) continue;
+      for (int dx = 0; dx <= BOLD_X; dx++) {
+        for (int dy = 0; dy <= BOLD_Y; dy++) {
+          writePixel(x + col + dx, y + row + dy, true);
+        }
+      }
+    }
+  }
+}
+
+void drawStringBold(int x, int y, const char *str) {
+  int cx = x;
+  while (*str) {
+    if (cx > -GLYPH_W && cx < PANEL_WIDTH_PIXELS) drawCharBold(cx, y, *str);
+    cx += CHAR_ADVANCE;
+    str++;
+  }
+}
+
+// ================================================================
+//  Servos — manual pulse generation (unchanged from your version)
+// ================================================================
+#define SERVO_BIO_PIN     5
+#define SERVO_NONBIO_PIN  6
+
+#define SERVO_PERIOD_US      20000UL  // 50Hz
+#define SERVO_SETTLE_MS      400UL
+
+unsigned long servoLastPulseTime = 0;
+int           activeServoPin     = -1;
+int           activeServoPulseUs = 1500;
+bool          servoActive        = false;
+
+int angleToPulseUs(int angleDeg) {
+  return map(angleDeg, 0, 180, 1000, 2000);
+}
+
+// NOTE: the noInterrupts()/interrupts() guard was originally needed to
+// stop DMD2's Timer1 ISR from stretching the pulse mid-way. There's no
+// competing ISR anymore (scanDisplay() runs cooperatively from loop()),
+// but it's kept here since it doesn't hurt and keeps pulse timing tight.
+void sendServoPulse(int pin, int pulseUs) {
+  noInterrupts();
+  digitalWrite(pin, HIGH);
+  delayMicroseconds(pulseUs);
+  digitalWrite(pin, LOW);
+  interrupts();
+}
+
+void driveServoPulses() {
+  if (!servoActive || activeServoPin == -1) return;
+
+  unsigned long now = micros();
+  if (now - servoLastPulseTime >= SERVO_PERIOD_US) {
+    servoLastPulseTime = now;
+    sendServoPulse(activeServoPin, activeServoPulseUs);
+  }
+}
+
+// Blocking helper used only once at boot. Keeps refreshing the panel
+// while it holds the servo at its initial position.
+void initServoPosition(int pin, int pulseUs, unsigned long durationMs) {
+  unsigned long start = millis();
+  while (millis() - start < durationMs) {
+    sendServoPulse(pin, pulseUs);
+    scanDisplay();
+    delay(18); // completes roughly a 20ms period
+  }
+}
+
+#define BIO_CLOSED_ANGLE     0
+#define BIO_OPEN_ANGLE       90
+#define BIO_OPEN_HOLD_MS     3000UL
+
+#define NONBIO_STOP_PULSE_US 1500
+#define NONBIO_RUN_PULSE_US  1000
+#define NONBIO_RUN_MS        1500UL
+
+#define THANKYOU_DELAY_MS    4000UL
+
+// ================================================================
+//  Scroll / text state
+// ================================================================
+String  displayText  = "SMART BIN SCAN ID";
+int     textPosX     = PANEL_WIDTH_PIXELS;
+int     textPixelLen = 0;
+int     textY;
+
+unsigned long lastScrollTime = 0;
+#define SCROLL_INTERVAL_MS 62 // lower = faster scroll (was 70, slowed down per your feedback)
+#define GAP_PIXELS 8            // blank gap between end of text and its restart
+
+// ================================================================
+//  GM67 scanner state
+// ================================================================
+const int MAX_ID_LENGTH = 32;
+char      idBuffer[MAX_ID_LENGTH];
+int       idIndex = 0;
+
+String        lastScannedID = "";
+unsigned long lastScanTime  = 0;
+const unsigned long DUPLICATE_IGNORE_WINDOW = 3000UL;
+
+// ================================================================
+//  System state machine
+// ================================================================
+enum SystemState {
+  STATE_IDLE_SCAN,
+  STATE_ID_SHOWN_WAIT_INPUT,
+  STATE_BIO_ACTUATING,
+  STATE_BIO_SETTLING,
+  STATE_NONBIO_ACTUATING,
+  STATE_NONBIO_SETTLING,
+  STATE_THANKYOU
+};
+
+SystemState   currentState    = STATE_IDLE_SCAN;
+unsigned long stateEnteredAt  = 0;
+String        currentID       = "";
+
+// ============================================================
+void setup() {
+  pinMode(DATA_PIN, OUTPUT);
+  pinMode(CLK_PIN, OUTPUT);
+  pinMode(OE_PIN, OUTPUT);
+  pinMode(A_PIN, OUTPUT);
+  pinMode(B_PIN, OUTPUT);
+  pinMode(LATCH_PIN, OUTPUT);
+
+  digitalWrite(A_PIN, LOW);
+  digitalWrite(B_PIN, LOW);
+  digitalWrite(CLK_PIN, LOW);
+  digitalWrite(LATCH_PIN, LOW);
+  digitalWrite(DATA_PIN, HIGH);
+  rowsOff();
+
+  pinMode(SERVO_BIO_PIN, OUTPUT);
+  pinMode(SERVO_NONBIO_PIN, OUTPUT);
+
+  Serial.begin(9600);
+  scannerSerial.begin(9600);
+
+  textY = (PANEL_HEIGHT_PIXELS - GLYPH_H) / 2;
+  clearScreen(true);
+
+  Serial.println(F("[SERVO] Setting initial positions..."));
+  initServoPosition(SERVO_BIO_PIN, angleToPulseUs(BIO_CLOSED_ANGLE), 500);
+  initServoPosition(SERVO_NONBIO_PIN, NONBIO_STOP_PULSE_US, 500);
+  Serial.println(F("[SERVO] Initial positions set."));
+
+  goToIdle();
+
+  Serial.println(F("[BOOT] Smart bin ready (raw P10 driver, no DMD2)."));
+  Serial.println(F("[BOOT] Type BIO or NON BIO in Serial Monitor after a scan to test."));
+}
+
+// ============================================================
+void loop() {
+  scanDisplay();      // refresh panel every pass — replaces DMD2's Timer1 ISR
+  driveServoPulses();
+  updateScroll();
+
+  switch (currentState) {
+    case STATE_IDLE_SCAN:
+      readScanner();
+      break;
+
+    case STATE_ID_SHOWN_WAIT_INPUT:
+      checkSerialInput();
+      break;
+
+    case STATE_BIO_ACTUATING:
+      updateBioActuation();
+      break;
+
+    case STATE_BIO_SETTLING:
+      updateBioSettling();
+      break;
+
+    case STATE_NONBIO_ACTUATING:
+      updateNonBioActuation();
+      break;
+
+    case STATE_NONBIO_SETTLING:
+      updateNonBioSettling();
+      break;
+
+    case STATE_THANKYOU:
+      updateThankYou();
+      break;
+  }
+}
+
+// ============================================================
+//  Display helpers
+// ============================================================
+void setDisplayText(String text) {
+  displayText  = text;
+  textPixelLen = text.length() * CHAR_ADVANCE;
+  textPosX     = PANEL_WIDTH_PIXELS;
+  renderScrollFrame();   // draw immediately so it's not blank until next scroll tick
+}
+
+void renderScrollFrame() {
+  clearScreen(true);
+  drawStringBold(textPosX, textY, displayText.c_str());
+}
+
+void updateScroll() {
+  unsigned long now = millis();
+  if (now - lastScrollTime < SCROLL_INTERVAL_MS) return;
+  lastScrollTime = now;
+
+  textPosX--;
+  if (textPosX < -(textPixelLen + GAP_PIXELS)) {
+    textPosX = PANEL_WIDTH_PIXELS; // loop current message until state logic changes it
+  }
+  renderScrollFrame();
+}
+
+// ============================================================
+//  State transitions
+// ============================================================
+void goToIdle() {
+  currentState = STATE_IDLE_SCAN;
+  currentID    = "";
+  setDisplayText("SMART BIN SCAN ID");
+  Serial.println(F("[STATE] IDLE_SCAN — waiting for a scan"));
+}
+
+void goToWaitInput(String id) {
+  currentState   = STATE_ID_SHOWN_WAIT_INPUT;
+  currentID      = id;
+  stateEnteredAt = millis();
+  setDisplayText(id);
+  Serial.println("[STATE] ID_SHOWN_WAIT_INPUT — waiting for BIO/NON BIO input for ID: " + id);
+}
+
+void updateThankYou() {
+  if (millis() - stateEnteredAt >= THANKYOU_DELAY_MS) {
+    goToIdle();
+  }
+}
+
+// ============================================================
+//  GM67 scanner reading
+// ============================================================
+void readScanner() {
+  while (scannerSerial.available()) {
+    char c = scannerSerial.read();
+
+    if (c == '\r' || c == '\n') {
+      if (idIndex > 0) {
+        idBuffer[idIndex] = '\0';
+        processScannedID(idBuffer);
+        idIndex = 0;
+      }
+    } else if (idIndex < MAX_ID_LENGTH - 1) {
+      idBuffer[idIndex++] = c;
+    }
+  }
+}
+
+void processScannedID(const char* rawID) {
+  String scannedID = String(rawID);
+  scannedID.trim();
+  if (scannedID.length() == 0) return;
+
+  unsigned long now = millis();
+  if (scannedID == lastScannedID && (now - lastScanTime) < DUPLICATE_IGNORE_WINDOW) {
+    Serial.println("[SCAN] Duplicate ignored: " + scannedID);
+    return;
+  }
+
+  lastScannedID = scannedID;
+  lastScanTime  = now;
+
+  Serial.println("[SCAN] Scanned ID: " + scannedID);
+  goToWaitInput(scannedID);
+}
+
+// ============================================================
+//  Bio / non-bio input (Serial Monitor for now)
+// ============================================================
+void checkSerialInput() {
+  if (!Serial.available()) return;
+
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+  input.toUpperCase();
+
+  if (input.length() == 0) return;
+
+  Serial.println("[INPUT] Received: " + input);
+
+  if (input == "BIO") {
+    startBioOpen();
+  } else if (input == "NON BIO" || input == "NONBIO") {
+    startNonBioOpen();
+  } else {
+    Serial.println(F("[INPUT] Not recognized. Type BIO or NON BIO."));
+  }
+}
+
+// ============================================================
+//  Bio bin — 180° servo (manual pulse control)
+// ============================================================
+void startBioOpen() {
+  Serial.println("[SERVO-BIO] Opening for ID: " + currentID);
+  activeServoPin     = SERVO_BIO_PIN;
+  activeServoPulseUs = angleToPulseUs(BIO_OPEN_ANGLE);
+  servoActive        = true;
+  stateEnteredAt      = millis();
+  currentState        = STATE_BIO_ACTUATING;
+  setDisplayText("THANK YOU COME LATER");
+}
+
+void updateBioActuation() {
+  if (millis() - stateEnteredAt >= BIO_OPEN_HOLD_MS) {
+    Serial.println(F("[SERVO-BIO] Closing"));
+    activeServoPulseUs = angleToPulseUs(BIO_CLOSED_ANGLE);
+    stateEnteredAt      = millis();
+    currentState        = STATE_BIO_SETTLING;
+  }
+}
+
+void updateBioSettling() {
+  if (millis() - stateEnteredAt >= SERVO_SETTLE_MS) {
+    servoActive    = false;
+    activeServoPin = -1;
+    Serial.println(F("[SERVO-BIO] Closed"));
+    currentState   = STATE_THANKYOU;
+    stateEnteredAt = millis();
+  }
+}
+
+// ============================================================
+//  Non-bio bin — 360° continuous rotation servo (manual pulse control)
+// ============================================================
+void startNonBioOpen() {
+  Serial.println("[SERVO-NONBIO] Rotating open for ID: " + currentID);
+  activeServoPin     = SERVO_NONBIO_PIN;
+  activeServoPulseUs = NONBIO_RUN_PULSE_US;
+  servoActive        = true;
+  stateEnteredAt      = millis();
+  currentState        = STATE_NONBIO_ACTUATING;
+  setDisplayText("THANK YOU COME LATER");
+}
+
+void updateNonBioActuation() {
+  if (millis() - stateEnteredAt >= NONBIO_RUN_MS) {
+    Serial.println(F("[SERVO-NONBIO] Stopping"));
+    activeServoPulseUs = NONBIO_STOP_PULSE_US;
+    stateEnteredAt      = millis();
+    currentState        = STATE_NONBIO_SETTLING;
+  }
+}
+
+void updateNonBioSettling() {
+  if (millis() - stateEnteredAt >= SERVO_SETTLE_MS) {
+    servoActive    = false;
+    activeServoPin = -1;
+    Serial.println(F("[SERVO-NONBIO] Stopped"));
+    currentState   = STATE_THANKYOU;
+    stateEnteredAt = millis();
+  }
+}
