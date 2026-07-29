@@ -1,0 +1,442 @@
+// ============================================================
+//  SMART BIN
+//  P10 (32x16) LED Matrix + GM67 Scanner + 2 Servos
+//
+//  FLOW
+//    1. Boot        -> "SMART BIN"  loops continuously
+//    2. Scan card   -> ID scrolls ONCE only
+//    3. Then        -> "YOUR WASTE" loops, waiting for input
+//    4. Press B/N   -> matching servo 0 -> 90 (open)
+//                      display shows "BIO" / "NON BIO"
+//    5. After hold  -> servo 90 -> 0 (close)
+//    6. Then        -> "THANK YOU" scrolls ONCE
+//    7. Back to step 1
+//
+//  Board: any Arduino with Serial1 (Mega / Leonardo / Uno Q)
+// ============================================================
+
+#include <Servo.h>
+
+// ---- PANEL PINS ----
+#define DATA_PIN    11
+#define CLK_PIN     13
+#define OE_PIN       9
+#define A_PIN        8
+#define B_PIN        7
+#define LATCH_PIN    4
+#define OE_ACTIVE_LOW 1
+
+// ---- SERVO PINS ----
+#define SERVO_BIO_PIN     5
+#define SERVO_NONBIO_PIN  3
+#define ANGLE_CLOSED      0
+#define ANGLE_OPEN       90
+
+// Detach servos when idle: kills the pulse train, so no
+// servo buzz and no ISR jitter on the display multiplex.
+// Set to 0 if the flap sags under its own weight.
+#define SERVO_DETACH_WHEN_IDLE 1
+
+// ---- PANEL GEOMETRY ----
+#define PANEL_WIDTH_PIXELS  32
+#define PANEL_HEIGHT_PIXELS 16
+#define ROW_BYTES           (PANEL_WIDTH_PIXELS / 8)
+#define RAM_BYTES           (ROW_BYTES * PANEL_HEIGHT_PIXELS)
+#define ROW1_OFFSET         (ROW_BYTES * 4)
+#define ROW2_OFFSET         (ROW_BYTES * 8)
+#define ROW3_OFFSET         (ROW_BYTES * 12)
+
+// ---- BOLD ----
+#define BOLD_X 0
+#define BOLD_Y 0
+
+// ---- SCROLL ----
+#define SCROLL_INTERVAL_MS  70
+#define GAP_PIXELS           8
+
+// ---- BRIGHTNESS ----
+#define ROW_SLOT_MICROS          1200
+#define ROW_ON_MICROS            1000
+#define ROW_BLANK_MICROS         (ROW_SLOT_MICROS - ROW_ON_MICROS)
+#define ROW_SWITCH_DELAY_MICROS    60
+#define POST_LATCH_BLANK_MICROS    30
+
+// ---- BARCODE ----
+#define BARCODE_TIMEOUT_MS  80
+#define MAX_TEXT_LEN        64
+
+// ---- TIMING ----
+#define LID_OPEN_HOLD_MS   3000   // how long the lid stays open
+#define SERVO_TRAVEL_MS     600   // time for servo to physically move 90 deg
+
+// ============================================================
+//  State machine
+// ============================================================
+enum AppState {
+  S_IDLE,       // "SMART BIN" loops
+  S_SHOW_ID,    // scanned ID scrolls exactly once
+  S_ASK_WASTE,  // "YOUR WASTE" loops, waiting for B / N
+  S_OPEN,       // servo at 90, category name loops
+  S_CLOSING,    // servo returning to 0
+  S_THANKS      // "THANK YOU" scrolls once
+};
+AppState appState = S_IDLE;
+
+Servo servoBio;
+Servo servoNonBio;
+Servo *activeServo = NULL;
+
+unsigned long stateStartMs = 0;
+
+// ---- DISPLAY ----
+char scrollBuf[MAX_TEXT_LEN + 1];
+byte screenRAM[RAM_BYTES];
+byte scanRow = 0;
+const byte pixelLookup[8] = {0x80,0x40,0x20,0x10,0x08,0x04,0x02,0x01};
+
+int  textPixelWidth;
+int  textY;
+int  scrollX;
+unsigned long lastScrollMs = 0;
+
+// ---- BARCODE ----
+char barcodeRaw[MAX_TEXT_LEN + 1];
+int  barcodeLen = 0;
+bool receiving  = false;
+unsigned long lastByteMs = 0;
+
+// ============================================================
+//  Low-level display
+// ============================================================
+inline void clockPulse() {
+  digitalWrite(CLK_PIN, HIGH);
+  digitalWrite(CLK_PIN, LOW);
+}
+inline void shiftOutByte(byte b) {
+  for (int8_t i = 7; i >= 0; i--) {
+    digitalWrite(DATA_PIN, (b & (1 << i)) ? HIGH : LOW);
+    clockPulse();
+  }
+}
+inline void latchPulse() {
+  digitalWrite(LATCH_PIN, HIGH);
+  digitalWrite(LATCH_PIN, LOW);
+}
+
+#if OE_ACTIVE_LOW
+  inline void rowsOff() { digitalWrite(OE_PIN, LOW);  }
+  inline void rowsOn()  { digitalWrite(OE_PIN, HIGH); }
+#else
+  inline void rowsOff() { digitalWrite(OE_PIN, HIGH); }
+  inline void rowsOn()  { digitalWrite(OE_PIN, LOW);  }
+#endif
+
+inline void selectRowGroup(byte g) {
+  digitalWrite(B_PIN, (g & 0x02) ? HIGH : LOW);
+  digitalWrite(A_PIN, (g & 0x01) ? HIGH : LOW);
+}
+
+void clearScreen(bool allOff) {
+  memset(screenRAM, allOff ? 0xFF : 0x00, RAM_BYTES);
+}
+
+void writePixel(int x, int y, bool on) {
+  if (x < 0 || x >= PANEL_WIDTH_PIXELS || y < 0 || y >= PANEL_HEIGHT_PIXELS) return;
+  int  idx  = (x / 8) + y * ROW_BYTES;
+  byte mask = pixelLookup[x & 0x07];
+  if (on) screenRAM[idx] &= ~mask;
+  else    screenRAM[idx] |=  mask;
+}
+
+void scanDisplay() {
+  int offset = ROW_BYTES * scanRow;
+  rowsOff();
+  for (int i = 0; i < ROW_BYTES; i++) {
+    shiftOutByte(screenRAM[offset + i + ROW3_OFFSET]);
+    shiftOutByte(screenRAM[offset + i + ROW2_OFFSET]);
+    shiftOutByte(screenRAM[offset + i + ROW1_OFFSET]);
+    shiftOutByte(screenRAM[offset + i]);
+  }
+  latchPulse();
+  delayMicroseconds(POST_LATCH_BLANK_MICROS);
+  selectRowGroup(scanRow);
+  delayMicroseconds(ROW_SWITCH_DELAY_MICROS);
+  rowsOn();
+  delayMicroseconds(ROW_ON_MICROS);
+  rowsOff();
+  delayMicroseconds(ROW_BLANK_MICROS);
+  scanRow = (scanRow + 1) & 0x03;
+}
+
+// ============================================================
+//  Font  (5x7, ASCII 32..126)
+// ============================================================
+const byte font5x7[95][5] = {
+  {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
+  {0x14,0x7F,0x14,0x7F,0x14},{0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},
+  {0x36,0x49,0x56,0x20,0x50},{0x00,0x08,0x07,0x03,0x00},{0x00,0x1C,0x22,0x41,0x00},
+  {0x00,0x41,0x22,0x1C,0x00},{0x2A,0x1C,0x7F,0x1C,0x2A},{0x08,0x08,0x3E,0x08,0x08},
+  {0x00,0x80,0x70,0x30,0x00},{0x08,0x08,0x08,0x08,0x08},{0x00,0x00,0x60,0x60,0x00},
+  {0x20,0x10,0x08,0x04,0x02},{0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},
+  {0x72,0x49,0x49,0x49,0x46},{0x21,0x41,0x49,0x4D,0x33},{0x18,0x14,0x12,0x7F,0x10},
+  {0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},
+  {0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},{0x00,0x36,0x36,0x00,0x00},
+  {0x00,0x56,0x36,0x00,0x00},{0x08,0x14,0x22,0x41,0x00},{0x14,0x14,0x14,0x14,0x14},
+  {0x00,0x41,0x22,0x14,0x08},{0x02,0x01,0x59,0x09,0x06},{0x3E,0x41,0x5D,0x59,0x4E},
+  {0x7C,0x12,0x11,0x12,0x7C},{0x7F,0x49,0x49,0x49,0x36},{0x3E,0x41,0x41,0x41,0x22},
+  {0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},
+  {0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},
+  {0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},
+  {0x7F,0x02,0x0C,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},
+  {0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},
+  {0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},
+  {0x1F,0x20,0x40,0x20,0x1F},{0x7F,0x20,0x18,0x20,0x7F},{0x63,0x14,0x08,0x14,0x63},
+  {0x03,0x04,0x78,0x04,0x03},{0x61,0x51,0x49,0x45,0x43},{0x00,0x00,0x7F,0x41,0x41},
+  {0x02,0x04,0x08,0x10,0x20},{0x41,0x41,0x7F,0x00,0x00},{0x04,0x02,0x01,0x02,0x04},
+  {0x40,0x40,0x40,0x40,0x40},{0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},
+  {0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},{0x38,0x44,0x44,0x48,0x7F},
+  {0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x0C,0x52,0x52,0x52,0x3E},
+  {0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},
+  {0x7F,0x10,0x28,0x44,0x00},{0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},
+  {0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},{0x7C,0x14,0x14,0x14,0x08},
+  {0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
+  {0x04,0x3F,0x44,0x40,0x20},{0x3C,0x40,0x40,0x20,0x7C},{0x1C,0x20,0x40,0x20,0x1C},
+  {0x3C,0x40,0x30,0x40,0x3C},{0x44,0x28,0x10,0x28,0x44},{0x0C,0x50,0x50,0x50,0x3C},
+  {0x44,0x64,0x54,0x4C,0x44},{0x00,0x08,0x36,0x41,0x00},{0x00,0x00,0x7F,0x00,0x00},
+  {0x00,0x41,0x36,0x08,0x00},{0x08,0x08,0x2A,0x1C,0x08}
+};
+
+#define GLYPH_W      (5 + BOLD_X)
+#define GLYPH_H      (7 + BOLD_Y)
+#define CHAR_ADVANCE (GLYPH_W + 1)
+
+void drawCharBold(int x, int y, char c) {
+  if (c < 32 || c > 126) c = 32;
+  const byte *glyph = font5x7[c - 32];
+  for (int col = 0; col < 5; col++) {
+    byte colBits = glyph[col];
+    for (int row = 0; row < 7; row++) {
+      if (!(colBits & (1 << row))) continue;
+      for (int dx = 0; dx <= BOLD_X; dx++)
+        for (int dy = 0; dy <= BOLD_Y; dy++)
+          writePixel(x + col + dx, y + row + dy, true);
+    }
+  }
+}
+
+void drawStringBold(int x, int y, const char *str) {
+  int cx = x;
+  while (*str) {
+    if (cx > -GLYPH_W && cx < PANEL_WIDTH_PIXELS) drawCharBold(cx, y, *str);
+    cx += CHAR_ADVANCE;
+    str++;
+  }
+}
+
+// ============================================================
+//  Scroll helpers
+// ============================================================
+void renderFrame() {
+  clearScreen(true);
+  drawStringBold(scrollX, textY, scrollBuf);
+}
+
+void setText(const char *s) {
+  strncpy(scrollBuf, s, MAX_TEXT_LEN);
+  scrollBuf[MAX_TEXT_LEN] = '\0';
+  textPixelWidth = (int)strlen(scrollBuf) * CHAR_ADVANCE;
+  scrollX = PANEL_WIDTH_PIXELS;     // enter from right edge
+  renderFrame();
+}
+
+// ============================================================
+//  Servo helpers
+// ============================================================
+void servosInit() {
+  servoBio.attach(SERVO_BIO_PIN);
+  servoNonBio.attach(SERVO_NONBIO_PIN);
+  servoBio.write(ANGLE_CLOSED);
+  servoNonBio.write(ANGLE_CLOSED);
+  delay(SERVO_TRAVEL_MS);           // one-time, in setup only
+#if SERVO_DETACH_WHEN_IDLE
+  servoBio.detach();
+  servoNonBio.detach();
+#endif
+}
+
+void openLid(bool isBio) {
+  activeServo = isBio ? &servoBio : &servoNonBio;
+#if SERVO_DETACH_WHEN_IDLE
+  activeServo->attach(isBio ? SERVO_BIO_PIN : SERVO_NONBIO_PIN);
+#endif
+  activeServo->write(ANGLE_OPEN);
+}
+
+void closeLid() {
+  if (activeServo) activeServo->write(ANGLE_CLOSED);
+}
+
+void releaseLid() {
+#if SERVO_DETACH_WHEN_IDLE
+  if (activeServo) activeServo->detach();
+#endif
+  activeServo = NULL;
+}
+
+// ============================================================
+//  State entry
+// ============================================================
+void enterState(AppState s, const char *text) {
+  appState     = s;
+  stateStartMs = millis();
+  setText(text);
+}
+
+// ============================================================
+//  Non-blocking barcode reader  (Serial1 = GM67)
+// ============================================================
+void handleBarcode() {
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (barcodeLen < MAX_TEXT_LEN) barcodeRaw[barcodeLen++] = c;
+    lastByteMs = millis();
+    receiving  = true;
+  }
+
+  if (receiving && (millis() - lastByteMs >= BARCODE_TIMEOUT_MS)) {
+    receiving = false;
+
+    while (barcodeLen > 0 &&
+           (barcodeRaw[barcodeLen-1] == '\r' ||
+            barcodeRaw[barcodeLen-1] == '\n' ||
+            barcodeRaw[barcodeLen-1] == ' ')) {
+      barcodeLen--;
+    }
+    barcodeRaw[barcodeLen] = '\0';
+
+    // Accept a card ONLY when idle -> prevents repeat display
+    if (barcodeLen > 0 && appState == S_IDLE) {
+      enterState(S_SHOW_ID, barcodeRaw);
+      Serial.print(F("ID: "));
+      Serial.println(scrollBuf);
+    }
+
+    barcodeLen = 0;
+  }
+}
+
+// ============================================================
+//  Manual waste selection  (Serial Monitor: B or N)
+// ============================================================
+void handleKeyInput() {
+  while (Serial.available()) {
+    char k = Serial.read();
+
+    if (appState != S_ASK_WASTE) continue;   // ignore keys otherwise
+
+    if (k == 'b' || k == 'B') {
+      openLid(true);
+      enterState(S_OPEN, "BIO");
+      Serial.println(F("-> BIO lid OPEN (90)"));
+    }
+    else if (k == 'n' || k == 'N') {
+      openLid(false);
+      enterState(S_OPEN, "NON BIO");
+      Serial.println(F("-> NON BIO lid OPEN (90)"));
+    }
+  }
+}
+
+// ============================================================
+//  Called when one full scroll pass completes
+// ============================================================
+void onScrollComplete() {
+  switch (appState) {
+
+    case S_IDLE:
+    case S_ASK_WASTE:
+    case S_OPEN:
+    case S_CLOSING:
+      scrollX = PANEL_WIDTH_PIXELS;   // these states loop their text
+      break;
+
+    case S_SHOW_ID:                   // ID shown exactly ONCE
+      enterState(S_ASK_WASTE, "YOUR WASTE");
+      while (Serial.available()) Serial.read();   // flush stale keys
+      Serial.println(F("Press B = BIO, N = NON BIO"));
+      break;
+
+    case S_THANKS:                    // THANK YOU shown once
+      enterState(S_IDLE, "SMART BIN");
+      Serial.println(F("Ready. Waiting for scan..."));
+      break;
+  }
+}
+
+// ============================================================
+//  Timed state transitions (servo motion)
+// ============================================================
+void handleTimers() {
+  unsigned long elapsed = millis() - stateStartMs;
+
+  if (appState == S_OPEN && elapsed >= LID_OPEN_HOLD_MS) {
+    closeLid();
+    enterState(S_CLOSING, "CLOSING");
+    Serial.println(F("-> lid CLOSE (0)"));
+  }
+  else if (appState == S_CLOSING && elapsed >= SERVO_TRAVEL_MS) {
+    releaseLid();
+    enterState(S_THANKS, "THANK YOU");
+    Serial.println(F("-> THANK YOU"));
+  }
+}
+
+// ============================================================
+//  setup / loop
+// ============================================================
+void setup() {
+  Serial.begin(9600);     // USB  - monitor + manual B/N input
+  Serial1.begin(9600);    // UART - GM67 scanner
+
+  pinMode(DATA_PIN,  OUTPUT);
+  pinMode(CLK_PIN,   OUTPUT);
+  pinMode(OE_PIN,    OUTPUT);
+  pinMode(A_PIN,     OUTPUT);
+  pinMode(B_PIN,     OUTPUT);
+  pinMode(LATCH_PIN, OUTPUT);
+
+  digitalWrite(A_PIN,     LOW);
+  digitalWrite(B_PIN,     LOW);
+  digitalWrite(CLK_PIN,   LOW);
+  digitalWrite(LATCH_PIN, LOW);
+  digitalWrite(DATA_PIN,  HIGH);
+  rowsOff();
+  clearScreen(true);
+
+  textY = (PANEL_HEIGHT_PIXELS - GLYPH_H) / 2;
+
+  servosInit();                       // both lids to 0 deg
+
+  enterState(S_IDLE, "SMART BIN");
+
+  Serial.println(F("SMART BIN ready. Waiting for scan..."));
+}
+
+void loop() {
+  scanDisplay();      // display multiplex - never block after this
+
+  handleBarcode();    // GM67 -> ID
+  handleKeyInput();   // B / N -> servo
+  handleTimers();     // servo open/close timing
+
+  unsigned long now = millis();
+  if (now - lastScrollMs >= SCROLL_INTERVAL_MS) {
+    lastScrollMs = now;
+    scrollX--;
+    if (scrollX < -(textPixelWidth + GAP_PIXELS)) {
+      onScrollComplete();
+    } else {
+      renderFrame();
+    }
+  }
+}
