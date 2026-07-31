@@ -1,0 +1,119 @@
+import json
+import os
+import cv2
+import numpy as np
+from arduino.app_peripherals.camera import Camera
+from arduino.app_utils import App, Bridge
+from google import genai
+from google.genai import types
+
+# ---- CONFIG ----
+MODEL   = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+API_KEY = "AQ.Ab8RN6In_xuVbF4ENa65Q4OAeKs5Y8_BTx3yucBkgy0D47zzNw"
+
+if not API_KEY:
+    print("ERROR: GEMINI_API_KEY is not set. Set it in App Lab environment variables.")
+
+client = genai.Client(api_key=API_KEY) if API_KEY else None
+camera = Camera()
+camera.start()
+
+PROMPT = """
+You are an AI waste classifier.
+Classify the visible object into exactly one of these categories:
+- biodegradable
+- non_biodegradable
+Return ONLY valid JSON:
+{
+    "item": "banana peel",
+    "label": "biodegradable",
+    "confidence": 0.98
+}
+"""
+
+current_card_id = None
+
+# ---- IMAGE CAPTURE ----
+def capture_image_bytes() -> bytes:
+    frame = camera.capture()
+    if frame is None:
+        raise RuntimeError("camera.capture() returned None.")
+    if isinstance(frame, bytes):
+        return frame
+    elif isinstance(frame, np.ndarray):
+        ok, jpeg = cv2.imencode(".jpg", frame)
+        if not ok:
+            raise RuntimeError("Failed to encode frame to JPEG.")
+        return jpeg.tobytes()
+    else:
+        raise RuntimeError(f"Unknown frame type: {type(frame)}")
+
+# ---- GEMINI CLASSIFICATION ----
+def classify():
+    if not client:
+        raise RuntimeError("Gemini API key missing.")
+    image_bytes = capture_image_bytes()
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=[
+            PROMPT,
+            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+        ],
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    try:
+        result = json.loads(response.text.strip())
+        result.setdefault("item",       "Unknown")
+        result.setdefault("label",      "uncertain")
+        result.setdefault("confidence", 0.0)
+        return result
+    except Exception as e:
+        return {
+            "item": "Unknown", "label": "uncertain", "confidence": 0.0,
+            "error": f"JSON parse failed: {e}", "raw": response.text.strip()
+        }
+
+# ---- BRIDGE RPC HANDLERS ----
+def on_card_scanned(card_id: str):
+    """Called by Arduino MCU when GM67 scans a barcode/card."""
+    global current_card_id
+    current_card_id = str(card_id).strip()
+    print(f"[Python] Card ID received from MCU: {current_card_id}")
+
+def trigger_classification():
+    """Called by Arduino MCU after the 5-second placement timer expires."""
+    global current_card_id
+    print("[Python] Trigger received! Capturing frame & querying Gemini AI...")
+    try:
+        result     = classify()
+        label      = result.get("label", "uncertain")
+        item       = result.get("item",  "Unknown")
+        confidence = result.get("confidence", 0.0)
+        print(f"[Python] Classification: {item} -> {label} ({confidence:.0%})")
+
+        if label == "biodegradable":
+            print("[Python] Requesting MCU to open BIO lid...")
+            Bridge.notify("open_bio")
+        else:
+            print("[Python] Requesting MCU to open NON-BIO lid...")
+            Bridge.notify("open_nonbio")
+
+    except Exception as e:
+        print(f"[Python] Classification error: {e}")
+        # Fallback to NON-BIO lid so system execution continues
+        Bridge.notify("open_nonbio")
+
+# Register Bridge functions so C++ sketch can call them
+Bridge.provide("on_card_scanned", on_card_scanned)
+Bridge.provide("trigger_classification", trigger_classification)
+
+# ---- Application Entrypoint ----
+if __name__ == "__main__":
+    print("Smart Bin Headless Bridge Controller active.")
+    try:
+        App.run()
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        if hasattr(camera, "stop"):
+            camera.stop()
